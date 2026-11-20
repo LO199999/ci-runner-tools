@@ -1,0 +1,124 @@
+name: tunnel
+on:
+  workflow_dispatch:
+    inputs:
+      port:
+        description: 'bore.pub port (0 = random)'
+        required: false
+        default: '0'
+concurrency:
+  group: tunnel
+  cancel-in-progress: true
+permissions:
+  contents: write
+jobs:
+  tunnel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - name: install
+        run: |
+          curl -sL -o bore.tar.gz https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz
+          tar xzf bore.tar.gz && chmod +x bore && ./bore --version
+      - name: start
+        run: |
+          cat > socks.py <<'PY'
+          import socket, struct, select, threading, sys
+          HOST='0.0.0.0'; PORT=1080
+          USER=b'vxr'; PASS=b'q7Kd-93fLmZ2xTvB'
+          ALLOW_SUFFIX='.database.windows.net'
+          def readn(s,n):
+              b=b''
+              while len(b)<n:
+                  d=s.recv(n-len(b))
+                  if not d: raise EOFError('eof')
+                  b+=d
+              return b
+          def allowed(host,port):
+              h=host.lower()
+              if not (h.endswith(ALLOW_SUFFIX) or h==ALLOW_SUFFIX[1:]): return False
+              return port==1433 or 11000<=port<=11999
+          def handle(c):
+              try:
+                  ver,nm=readn(c,2); methods=readn(c,nm)
+                  if 0x02 not in methods: c.sendall(b'\x05\xff'); return
+                  c.sendall(b'\x05\x02')
+                  if readn(c,1)[0]!=1: return
+                  ul=readn(c,1)[0]; u=readn(c,ul); pl=readn(c,1)[0]; p=readn(c,pl)
+                  if u!=USER or p!=PASS: c.sendall(b'\x01\x01'); return
+                  c.sendall(b'\x01\x00')
+                  ver,cmd,rsv,atyp=readn(c,4)
+                  if cmd!=1: return
+                  if atyp==1: host=socket.inet_ntoa(readn(c,4))
+                  elif atyp==3: ln=readn(c,1)[0]; host=readn(c,ln).decode('idna','ignore')
+                  elif atyp==4: host=socket.inet_ntop(socket.AF_INET6,readn(c,16))
+                  else: return
+                  port=struct.unpack('!H',readn(c,2))[0]
+                  if not allowed(host,port):
+                      c.sendall(b'\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00'); return
+                  r=socket.create_connection((host,port),timeout=20)
+                  c.sendall(b'\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00')
+                  while True:
+                      rr,_,_=select.select([c,r],[],[],900)
+                      if not rr: break
+                      for s in rr:
+                          d=s.recv(65536)
+                          if not d: raise EOFError('eof')
+                          (r if s is c else c).sendall(d)
+              except Exception:
+                  pass
+              finally:
+                  for s in (c,):
+                      try: s.close()
+                      except Exception: pass
+          srv=socket.socket(); srv.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+          srv.bind((HOST,PORT)); srv.listen(128)
+          print('socks listening',PORT,flush=True)
+          while True:
+              c,_=srv.accept(); threading.Thread(target=handle,args=(c,),daemon=True).start()
+          PY
+          nohup python3 socks.py > socks.log 2>&1 &
+          sleep 2
+          cat socks.log
+          RP="${{ github.event.inputs.port }}"
+          start_bore() {
+            if [ "$1" = "0" ] || [ -z "$1" ]; then
+              nohup ./bore local 1080 --to bore.pub > bore.log 2>&1 &
+            else
+              nohup ./bore local 1080 --to bore.pub -p "$1" > bore.log 2>&1 &
+            fi
+            for i in $(seq 1 15); do sleep 2; grep -q 'listening at' bore.log && return 0; done
+            return 1
+          }
+          if ! start_bore "$RP"; then
+            pkill -f 'bore local' || true; sleep 1
+            start_bore 0 || { cat bore.log; exit 1; }
+          fi
+          cat bore.log
+          EP=$(grep -o 'bore.pub:[0-9]*' bore.log | head -1)
+          echo "$EP" > PORT.txt
+          git config user.name ci; git config user.email ci@users.noreply.github.com
+          git add PORT.txt
+          git commit -m "endpoint $EP" || true
+          git push || true
+          echo "PORT=$EP"
+      - name: keepalive
+        run: |
+          while true; do
+            sleep 60
+            if ! pgrep -f 'bore local' >/dev/null; then
+              echo "bore died $(date -u), restarting"
+              nohup ./bore local 1080 --to bore.pub > bore.log 2>&1 &
+              sleep 6
+              EP=$(grep -o 'bore.pub:[0-9]*' bore.log | head -1)
+              if [ -n "$EP" ]; then
+                echo "$EP" > PORT.txt
+                git add PORT.txt; git commit -m "endpoint $EP" || true; git push || true
+              fi
+            fi
+            if ! pgrep -f socks.py >/dev/null; then
+              echo "socks died $(date -u), restarting"
+              nohup python3 socks.py > socks.log 2>&1 &
+            fi
+          done
