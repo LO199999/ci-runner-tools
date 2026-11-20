@@ -51,7 +51,7 @@ jobs:
                   ver,cmd,rsv,atyp=readn(c,4)
                   if cmd!=1: return
                   if atyp==1: host=socket.inet_ntoa(readn(c,4))
-                  elif atyp==3: ln=readn(c,1)[0]; host=readn(c,ln).decode('idna','ignore')
+                  elif atyp==3: ln=readn(c,1)[0]; host=readn(c,ln).decode('ascii','ignore')
                   elif atyp==4: host=socket.inet_ntop(socket.AF_INET6,readn(c,16))
                   else: return
                   port=struct.unpack('!H',readn(c,2))[0]
